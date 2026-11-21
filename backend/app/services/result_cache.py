@@ -7,6 +7,7 @@ import uuid
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.cube_ref import cube_ref_matches, result_summary_refs_cube
 from app.store import store
 
 
@@ -43,7 +44,10 @@ class ResultCacheService(BaseModuleService):
             if not related:
                 cubes = store.rows("olap_cube")
                 for c in cubes:
-                    if str(source_id) in str(c.get("数据来源", "")) and f"cube_{c.get('id')}" in summary:
+                    if (
+                        cube_ref_matches(c.get("数据来源"), source_id)
+                        and result_summary_refs_cube(summary, c.get("id"))
+                    ):
                         related = True
                         break
 

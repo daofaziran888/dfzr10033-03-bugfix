@@ -6,7 +6,7 @@ import io
 import time
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Body, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
@@ -80,7 +80,12 @@ def create_entry(module: str, payload: EntryPayload) -> ActionResult:
 def run_action(module: str, entry_id: int, payload: ActionPayload) -> ActionResult:
     service = require_service(module)
     entry, message = service.run_action(entry_id, payload.action.strip())
-    return ActionResult(ok=entry is not None, message=message, entry=entry)
+    # 服务层可以显式标注本次动作失败（例如指标计算没有完整批次），
+    # 此时仍返回条目当前状态，但 ok=False，前端不会把它当成成功产出。
+    ok = entry is not None
+    if entry is not None and entry.pop("_action_ok", True) is False:
+        ok = False
+    return ActionResult(ok=ok, message=message, entry=entry)
 
 
 # -- 8 条跨模块管道 API --
@@ -97,6 +102,7 @@ from app.services.query_audit import QueryAuditService
 from app.services.cost_govern import CostGovernService
 from app.services.data_contract import DataContractService
 from app.services.semantic_model import SemanticModelService
+from app.services.metric_factory import MetricFactoryService
 
 source_svc = SourceRegistryService()
 semantic_svc = SemanticModelService()
@@ -221,3 +227,70 @@ def pipeline_cost_aggregate_alert() -> dict[str, Any]:
             "cost_aggregation": cost_svc.aggregate_module_costs(),
             "quota_check": cost_svc.check_monthly_quota(),
             "cache_report": result_cache_svc.cache_hit_rate_report()}
+
+
+# -- 指标工厂：批次取数、可追溯结果与报表重算 --
+
+metric_svc = MetricFactoryService()
+
+
+@router.post("/pipelines/metric-compute")
+def pipeline_metric_compute(
+    metric_id: str = Query(...),
+    cube_id: str | None = Query(default=None),
+    dims: str | None = Query(default=None),
+    measures: str | None = Query(default=None),
+    batch_id: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """按完整立方标识从聚合缓存取完整批次计算指标，结果带批次写入结果缓存。"""
+    result = metric_svc.compute_metric(
+        metric_id,
+        cube_id,
+        dims=[d.strip() for d in dims.split(",") if d.strip()] if dims else None,
+        measures=[m.strip() for m in measures.split(",") if m.strip()] if measures else None,
+        batch_id=batch_id,
+    )
+    return {"pipeline": "metric_compute", **result}
+
+
+@router.post("/pipelines/metric-report")
+def pipeline_metric_report(
+    metric_ids: str | None = Query(default=None),
+    cube_id: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """报表重算：只读结果缓存里当时确认、带批次的指标数值。"""
+    ids = [m.strip() for m in metric_ids.split(",") if m.strip()] if metric_ids else None
+    return {"pipeline": "metric_report", **metric_svc.recompute_report(metric_ids=ids, cube_id=cube_id)}
+
+
+@router.post("/pipelines/metric-report/recompute")
+def pipeline_metric_report_recompute(
+    report: dict[str, Any] | list[Any] | None = Body(default=None),
+    cube_id: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """按历史报表（指标标识 + 计算口径）重算，兼容旧标识。"""
+    return {"pipeline": "metric_report_recompute", **metric_svc.recompute_report(report, cube_id=cube_id)}
+
+
+@router.post("/pipelines/aggregate-batches")
+def pipeline_aggregate_batches(
+    cube_id: str = Query(...),
+    dims: str | None = Query(default=None),
+    measures: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """列出指定立方可用于计算的完整批次，以及被排除的不完整批次。"""
+    dims_list = [d.strip() for d in dims.split(",") if d.strip()] if dims else None
+    measures_list = [m.strip() for m in measures.split(",") if m.strip()] if measures else None
+    complete = agg_cache_svc.list_complete_batches(cube_id, dims_list, measures_list)
+    partial = agg_cache_svc.incomplete_batches(cube_id, dims_list, measures_list)
+    return {
+        "pipeline": "aggregate_batches",
+        "cube_id": cube_id,
+        "complete_batches": [_batch_public(batch) for batch in complete],
+        "incomplete_batches": [_batch_public(batch) for batch in partial],
+        "usable_batch_id": complete[-1]["batch_id"] if complete else None,
+    }
+
+
+def _batch_public(batch: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in batch.items() if key not in ("rows", "data", "entry")}

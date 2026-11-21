@@ -73,6 +73,37 @@ npm run dev
 | 数据契约 | `data_contract` | 契约定义 | 契约编号、数据集、Schema约束 |
 | 实验配置 | `ab_config` | AB实验 | 实验编号、实验名称、分流比例 |
 
+## 指标取数链路（批次与可追溯结果）
+
+指标工厂的计算不再用「立方编号子串」找缓存，而是按完整立方标识 + 完整批次取数：
+
+1. **立方标识精确匹配**：`olap_cube:1` 与 `olap_cube:11` 是两座立方，
+   统一由 `app/services/cube_ref.py` 解析完整编号，杜绝立方 1 读到立方 11 的明细。
+2. **批次完整性**：`aggregate_cache` 的每条批次带 `batch_id` 与完整性标记
+   （`complete` / `expected_rows` / `完整性`）。指标计算只消费完整批次；
+   半批/未齐批次会被排除，半批金额不计入已确认合计。
+3. **并发只算一次**：刷新期间同一组维度 + 度量（或同一指标 + 立方 + 批次）的
+   并发提交由 `app/services/concurrent.py` 合并成一次实际计算，其余调用复用结果。
+4. **可追溯结果**：计算成功写入 `result_cache` 时同时记录
+   `batch_id`、`metric_id`、`cube_id`、`formula`、维度/度量与确认时间；
+   没有完整聚合依据时返回失败并标记 `产出异常`，不会用随机金额冒充一次成功产出，
+   同时清理历史上「有效但无批次」的结果。
+5. **报表重算读结果缓存**：`recompute_report` 只读取结果缓存里当时确认、带批次的数值，
+   兼容历史报表的指标标识（`METR-0001` / `metric_1` / 数字 id）与计算口径（公式）。
+   无可用结果的行会明确给出 `reason` 与可引用的批次，而不是给出猜测值。
+
+相关接口：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/pipelines/metric-compute` | 按完整立方标识取完整批次计算指标 |
+| POST | `/api/pipelines/aggregate-batches` | 列出某立方的完整/不完整批次 |
+| POST | `/api/pipelines/metric-report` | 报表重算（只读结果缓存确认值） |
+| POST | `/api/pipelines/metric-report/recompute` | 按历史报表标识与口径重算 |
+
+指标工厂列表里的「计算指标 / 确认产出」动作同样走这条链路，失败时接口返回
+`ok=false` 并保留异常状态。
+
 ## 约定
 
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。
